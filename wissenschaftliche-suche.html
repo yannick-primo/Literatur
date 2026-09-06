@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Wissenschaftliche Suchmaschine & Research Manager</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-50 min-h-screen text-slate-900 font-sans antialiased">
+
+    <div class="max-w-2xl mx-auto px-4 py-8">
+        <header class="text-center mb-8">
+            <h1 class="text-2xl font-bold tracking-tight text-slate-900">Wissenschaftliche Suchmaschine</h1>
+            <p class="text-sm text-slate-600 mt-1">OpenAlex & Crossref Live-Suche (Polite Pool aktiv)</p>
+        </header>
+
+        <div class="bg-white border border-slate-200 rounded-xl p-3 mb-4 flex items-center justify-between gap-3 text-sm">
+            <label class="flex items-center gap-2 cursor-pointer select-none">
+                <input type="checkbox" id="proxyToggle" checked class="w-4 h-4 accent-blue-600">
+                <span class="text-slate-700">Links über <strong>Uni Passau Proxy</strong> öffnen (EZproxy)</span>
+            </label>
+        </div>
+
+        <form id="searchForm" class="flex gap-2 mb-6">
+            <input 
+                type="text" 
+                id="searchInput" 
+                placeholder="Thema eingeben (z.B. Leseförderung)..." 
+                required
+                class="flex-1 px-4 py-3 rounded-xl border border-slate-300 focus:outline-none focus:ring-2 focus:ring-blue-600 text-base shadow-sm"
+            >
+            <button 
+                type="submit" 
+                id="searchButton"
+                class="bg-blue-600 hover:bg-blue-700 text-white px-5 py-3 rounded-xl font-medium shadow-sm transition-colors"
+            >
+                Suchen
+            </button>
+        </form>
+
+        <div id="errorContainer" class="hidden mb-4 text-sm bg-red-50 border border-red-200 text-red-800 rounded-xl p-4"></div>
+
+        <div id="loadingIndicator" class="hidden text-center py-8 text-slate-500">
+            <div class="inline-block animate-spin rounded-full h-6 w-6 border-b-2 border-blue-600 mb-2"></div>
+            <p class="text-sm">Durchsuche OpenAlex & Crossref parallel...</p>
+        </div>
+
+        <div id="statsContainer" class="mb-4 text-xs text-slate-500 px-1"></div>
+        <div id="resultsContainer" class="space-y-4"></div>
+    </div>
+
+    <script>
+        const EMAIL = "nicklaus.y@web.de";
+        // Offizieller EZproxy-Präfix der UB Passau (Quelle: ub.uni-passau.de/ordering-borrowing/external-access)
+        const UNI_PROXY_PREFIX = "https://docweb.rz.uni-passau.de:2443/login?url=";
+
+        function proxify(url) {
+            if (!url) return url;
+            const useProxy = document.getElementById('proxyToggle').checked;
+            return useProxy ? UNI_PROXY_PREFIX + encodeURIComponent(url) : url;
+        }
+
+        document.getElementById('searchForm').addEventListener('submit', async function(e) {
+            e.preventDefault();
+            const query = document.getElementById('searchInput').value.trim();
+            if (!query) return;
+
+            const loadingEl = document.getElementById('loadingIndicator');
+            const resultsEl = document.getElementById('resultsContainer');
+            const statsEl = document.getElementById('statsContainer');
+            const searchBtn = document.getElementById('searchButton');
+            const errorEl = document.getElementById('errorContainer');
+
+            loadingEl.classList.remove('hidden');
+            resultsEl.innerHTML = '';
+            statsEl.innerHTML = '';
+            errorEl.classList.add('hidden');
+            errorEl.innerHTML = '';
+            searchBtn.disabled = true;
+
+            try {
+                const encodedQuery = encodeURIComponent(query);
+
+                const [openAlexRes, crossrefRes] = await Promise.allSettled([
+                    fetch(`https://api.openalex.org/works?search=${encodedQuery}&mailto=${EMAIL}&per_page=15`)
+                        .then(res => res.ok ? res.json() : Promise.reject(new Error(`OpenAlex HTTP ${res.status}`))),
+                    // query.bibliographic liefert i.d.R. relevantere Treffer als query=
+                    fetch(`https://api.crossref.org/works?query.bibliographic=${encodedQuery}&rows=15&mailto=${EMAIL}`)
+                        .then(res => res.ok ? res.json() : Promise.reject(new Error(`Crossref HTTP ${res.status}`)))
+                ]);
+
+                // Diagnose: fehlgeschlagene Quellen sichtbar machen statt still zu verschlucken
+                const failures = [];
+                if (openAlexRes.status === 'rejected') failures.push(`OpenAlex: ${openAlexRes.reason?.message || openAlexRes.reason}`);
+                if (crossrefRes.status === 'rejected') failures.push(`Crossref: ${crossrefRes.reason?.message || crossrefRes.reason}`);
+                if (failures.length > 0) {
+                    errorEl.classList.remove('hidden');
+                    errorEl.innerHTML = `<strong>Achtung, Abfrage fehlgeschlagen:</strong><br>${failures.map(f => escapeHtml(f)).join('<br>')}<br><span class="text-xs">Häufigste Ursache: die Seite wurde als lokale Datei (file://) geöffnet statt über http/https, oder ein Browser-/Netzwerkfilter blockiert die Anfrage.</span>`;
+                }
+
+                let works = [];
+
+                if (openAlexRes.status === 'fulfilled' && openAlexRes.value.results) {
+                    const oaWorks = openAlexRes.value.results.map(item => ({
+                        id: item.id,
+                        canonicalTitle: item.title || 'Ohne Titel',
+                        authors: (item.authorships || []).map(a => a.author?.name).filter(Boolean),
+                        publicationYear: item.publication_year,
+                        type: item.type || 'article',
+                        // FIX: host_venue ist veraltet -> primary_location.source verwenden
+                        journal: item.primary_location?.source?.display_name || item.host_venue?.display_name || null,
+                        doi: item.doi ? item.doi.replace('https://doi.org/', '') : null,
+                        url: item.doi || item.id,
+                        pdfUrl: item.open_access?.oa_url || null,
+                        openAccess: item.open_access?.is_oa || false,
+                        citationCount: item.cited_by_count || 0,
+                        sourceProviders: ['OpenAlex']
+                    }));
+                    works.push(...oaWorks);
+                }
+
+                if (crossrefRes.status === 'fulfilled' && crossrefRes.value.message?.items) {
+                    const crWorks = crossrefRes.value.message.items.map(item => ({
+                        id: `crossref-${item.DOI || Math.random()}`,
+                        canonicalTitle: item.title?.[0] || 'Ohne Titel',
+                        authors: (item.author || []).map(a => `${a.given || ''} ${a.family || ''}`.trim()).filter(Boolean),
+                        publicationYear: item.published?.['date-parts']?.[0]?.[0],
+                        type: item.type || 'journal-article',
+                        journal: item['container-title']?.[0] || null,
+                        publisher: item.publisher,
+                        doi: item.DOI || null,
+                        url: item.DOI ? `https://doi.org/${item.DOI}` : (item.URL || null),
+                        openAccess: false,
+                        citationCount: item['is-referenced-by-count'] || 0,
+                        sourceProviders: ['Crossref']
+                    }));
+                    works.push(...crWorks);
+                }
+
+                const map = new Map();
+                for (const work of works) {
+                    const key = work.doi ? `doi:${work.doi.toLowerCase().trim()}` : `title:${work.canonicalTitle.toLowerCase().replace(/[^a-z0-9]/g, '')}`;
+                    if (map.has(key)) {
+                        const existing = map.get(key);
+                        existing.sourceProviders = Array.from(new Set([...existing.sourceProviders, ...work.sourceProviders]));
+                        if (!existing.pdfUrl && work.pdfUrl) existing.pdfUrl = work.pdfUrl;
+                        if (!existing.journal && work.journal) existing.journal = work.journal;
+                        if (work.citationCount > existing.citationCount) existing.citationCount = work.citationCount;
+                    } else {
+                        map.set(key, work);
+                    }
+                }
+
+                let finalWorks = Array.from(map.values());
+
+                finalWorks.sort((a, b) => {
+                    let scoreA = a.citationCount + (a.openAccess ? 10 : 0);
+                    let scoreB = b.citationCount + (b.openAccess ? 10 : 0);
+                    return scoreB - scoreA;
+                });
+
+                statsEl.innerHTML = `${finalWorks.length} bereinigte Treffer angezeigt (dedupliziert).`;
+
+                if (finalWorks.length === 0) {
+                    resultsEl.innerHTML = `<div class="text-center py-8 text-slate-500 bg-white rounded-xl shadow-sm p-6">Keine Ergebnisse gefunden.</div>`;
+                    return;
+                }
+
+                resultsEl.innerHTML = finalWorks.map(work => `
+                    <div class="bg-white p-5 rounded-2xl shadow-sm border border-slate-100 transition-all hover:shadow-md">
+                        <h3 class="font-semibold text-slate-900 text-base mb-1 leading-snug">${escapeHtml(work.canonicalTitle)}</h3>
+                        
+                        <p class="text-xs text-slate-600 mb-3">
+                            ${escapeHtml(work.authors.slice(0, 3).join(', '))} ${work.authors.length > 3 ? 'et al.' : ''}
+                            ${work.publicationYear ? ` (${work.publicationYear})` : ''}
+                            ${work.journal ? ` · ${escapeHtml(work.journal)}` : ''}
+                        </p>
+
+                        <div class="flex flex-wrap gap-2 items-center mb-4">
+                            ${work.openAccess ? '<span class="bg-emerald-50 text-emerald-700 text-xs font-semibold px-2.5 py-0.5 rounded-full">🟢 Open Access</span>' : ''}
+                            <span class="bg-slate-100 text-slate-700 text-xs font-medium px-2.5 py-0.5 rounded-full">⭐ ${work.citationCount} Zitationen</span>
+                            <span class="bg-sky-50 text-sky-700 text-xs font-medium px-2.5 py-0.5 rounded-full">${work.sourceProviders.join(', ')}</span>
+                        </div>
+
+                        <div class="flex gap-2 pt-2 border-t border-slate-100">
+                            ${work.pdfUrl ? `<a href="${work.pdfUrl}" target="_blank" rel="noreferrer" class="flex-1 text-center bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-medium py-2 px-3 rounded-lg transition-colors">PDF öffnen (frei zugänglich)</a>` : ''}
+                            ${work.url ? `<a href="${proxify(work.url)}" target="_blank" rel="noreferrer" class="flex-1 text-center bg-slate-100 hover:bg-slate-200 text-slate-800 text-xs font-medium py-2 px-3 rounded-lg transition-colors">Über Uni Passau öffnen</a>` : ''}
+                        </div>
+                    </div>
+                `).join('');
+
+            } catch (err) {
+                console.error(err);
+                resultsEl.innerHTML = `<div class="text-center py-8 text-red-500 bg-white rounded-xl shadow-sm p-6">Fehler bei der Verbindung zu den Datenbanken.</div>`;
+            } finally {
+                loadingEl.classList.add('hidden');
+                searchBtn.disabled = false;
+            }
+        });
+
+        function escapeHtml(str) {
+            if (!str) return '';
+            return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#039;");
+        }
+    </script>
+</body>
+</html>
